@@ -608,7 +608,7 @@ const Admin_Resume_Filter = () => {
                           padding: "12px",
                           color: "#1f2937"
                         }}>
-                          {res.education?.cgpa || "-"}
+                          {res.education?.bacheloy?.cgpa || "-"}
                         </td>
                         <td style={{
                           border: "1px solid #e5e7eb",
