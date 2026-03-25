@@ -11,3 +11,8 @@ openpyxl
 xlrd
 certifi
 google-auth
+openai
+python-multipart
+beautifulsoup4
+requests
+python-docx

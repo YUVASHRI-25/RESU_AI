@@ -14,10 +14,12 @@ from app.config import SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES
 import requests
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
+import logging
 
 load_dotenv()
 
 router = APIRouter(tags=["Authentication"])
+logger = logging.getLogger(__name__)
 
 # -------------------------------
 # MongoDB Connection (SSL Fixed)
@@ -118,10 +120,12 @@ def login_user(user: LoginModel):
     """
     try:
         found = users.find_one({"email": {"$regex": f"^{user.email}$", "$options": "i"}})
-    except PyMongoError:
-        raise HTTPException(status_code=503, detail="Database unavailable")
+    except PyMongoError as e:
+        logger.exception("Login DB query failed for email=%s", user.email)
+        raise HTTPException(status_code=503, detail="Database unavailable") from e
     if not found:
-        raise HTTPException(status_code=404, detail="User not found ❌")
+        # Invalid credentials should be unauthorized, not route/resource missing.
+        raise HTTPException(status_code=401, detail="Invalid email or password ❌")
 
     stored_password = found.get("password")
     if not stored_password:
@@ -179,8 +183,9 @@ def register_user(new_user: RegisterModel):
     """
     try:
         existing = users.find_one({"email": {"$regex": f"^{new_user.email}$", "$options": "i"}})
-    except PyMongoError:
-        raise HTTPException(status_code=503, detail="Database unavailable")
+    except PyMongoError as e:
+        logger.exception("Register lookup failed for email=%s", new_user.email)
+        raise HTTPException(status_code=503, detail="Database unavailable") from e
     if existing:
         raise HTTPException(status_code=409, detail="User already exists ❌")
 
@@ -195,8 +200,9 @@ def register_user(new_user: RegisterModel):
     try:
         result = users.insert_one(doc)
         created = users.find_one({"_id": result.inserted_id})
-    except PyMongoError:
-        raise HTTPException(status_code=503, detail="Database unavailable")
+    except PyMongoError as e:
+        logger.exception("Register insert failed for email=%s", new_user.email)
+        raise HTTPException(status_code=503, detail="Database unavailable") from e
 
     user_safe = _sanitize_user_doc(created)
     return {"status": "success", "message": "User registered ✅", "role": user_safe.get("role", "user"), "user": user_safe}
@@ -216,8 +222,9 @@ def set_password(payload: SetPasswordModel):
 
     try:
         existing = users.find_one({"email": email_ci})
-    except PyMongoError:
-        raise HTTPException(status_code=503, detail="Database unavailable")
+    except PyMongoError as e:
+        logger.exception("Set password lookup failed for email=%s", payload.email)
+        raise HTTPException(status_code=503, detail="Database unavailable") from e
 
     hashed = bcrypt.hashpw(payload.password.encode("utf-8"), bcrypt.gensalt())
 
@@ -228,8 +235,9 @@ def set_password(payload: SetPasswordModel):
         try:
             users.update_one({"_id": existing["_id"]}, update_doc)
             updated = users.find_one({"_id": existing["_id"]})
-        except PyMongoError:
-            raise HTTPException(status_code=503, detail="Database unavailable")
+        except PyMongoError as e:
+            logger.exception("Set password update failed for email=%s", payload.email)
+            raise HTTPException(status_code=503, detail="Database unavailable") from e
         safe = _sanitize_user_doc(updated)
         return {"status": "success", "message": "Password updated ✅", "role": safe.get("role", "user"), "user": safe}
     else:
@@ -241,8 +249,9 @@ def set_password(payload: SetPasswordModel):
         try:
             result = users.insert_one(doc)
             created = users.find_one({"_id": result.inserted_id})
-        except PyMongoError:
-            raise HTTPException(status_code=503, detail="Database unavailable")
+        except PyMongoError as e:
+            logger.exception("Set password create failed for email=%s", payload.email)
+            raise HTTPException(status_code=503, detail="Database unavailable") from e
         safe = _sanitize_user_doc(created)
         return {"status": "success", "message": "User created ✅", "role": safe.get("role", "user"), "user": safe}
 
@@ -308,8 +317,9 @@ def google_signin(payload: GoogleSignInModel):
         # Check if user exists
         try:
             existing_user = users.find_one({"email": {"$regex": f"^{email}$", "$options": "i"}})
-        except PyMongoError:
-            raise HTTPException(status_code=503, detail="Database unavailable")
+        except PyMongoError as e:
+            logger.exception("Google sign-in lookup failed for email=%s", email)
+            raise HTTPException(status_code=503, detail="Database unavailable") from e
         
         if existing_user:
             # User exists - force user role for Google Sign-In and update last login
@@ -340,8 +350,9 @@ def google_signin(payload: GoogleSignInModel):
                 created_user = users.find_one({"_id": result.inserted_id})
                 user_safe = _sanitize_user_doc(created_user)
                 role = "user"
-            except PyMongoError:
-                raise HTTPException(status_code=503, detail="Database unavailable")
+            except PyMongoError as e:
+                logger.exception("Google sign-in create failed for email=%s", email)
+                raise HTTPException(status_code=503, detail="Database unavailable") from e
         
         # Create JWT token
         token_data = {"sub": user_safe.get("_id"), "email": user_safe.get("email"), "role": role}

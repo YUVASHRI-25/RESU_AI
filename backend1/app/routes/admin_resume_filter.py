@@ -8,10 +8,17 @@ import json
 import re
 import asyncio
 from datetime import datetime
+import io
+import os
+import hashlib
+
+import pdfplumber
+from docx import Document
+from openai import OpenAI
 
 router = APIRouter()
 
-from app.config import SECRET_KEY, ALGORITHM, db
+from app.config import SECRET_KEY, ALGORITHM, db, openrouter_client
 import jwt
 
 # ---------------------------------------------------------
@@ -769,3 +776,397 @@ async def update_skillset_upload(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update upload: {str(e)}")
+
+
+# ---------------------------------------------------------
+# 🏆 Top Resume Filter (Trainer)
+# ---------------------------------------------------------
+
+class TopResumeFilterRequest(BaseModel):
+    top_n: int = 5
+    command: Optional[str] = None
+    use_openrouter: bool = True
+    filenames: Optional[List[str]] = None
+
+
+def _require_trainer_role(authorization: str | None) -> Dict[str, Any]:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization header required")
+    parts = authorization.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+
+    token = parts[1]
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Token verification failed")
+
+    if payload.get("role") != "trainer":
+        raise HTTPException(status_code=403, detail="Trainer role required")
+    return payload
+
+
+def _safe_float(value: Any) -> float:
+    if value is None:
+        return 0.0
+    s = str(value)
+    m = re.search(r"\d+(\.\d+)?", s)
+    if not m:
+        return 0.0
+    try:
+        return float(m.group())
+    except Exception:
+        return 0.0
+
+
+def _extract_resume_text_from_bytes(filename: str, content: bytes) -> str:
+    name = (filename or "").lower()
+
+    if name.endswith(".pdf"):
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            return "\n".join(page.extract_text() or "" for page in pdf.pages).strip()
+
+    if name.endswith(".docx"):
+        doc = Document(io.BytesIO(content))
+        return "\n".join(p.text for p in doc.paragraphs if p.text).strip()
+
+    if name.endswith(".doc"):
+        # Best-effort fallback for legacy .doc (without antiword/textract).
+        return content.decode("latin-1", errors="ignore").strip()
+
+    return ""
+
+
+def _parse_json_from_llm(raw: str) -> Any:
+    cleaned = (raw or "").strip().replace("```json", "").replace("```", "").strip()
+
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        pass
+
+    # Fallback: try extracting first JSON object from text
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return json.loads(cleaned[start:end + 1])
+
+    raise ValueError("Could not parse JSON from model output")
+
+
+def _groq_extract_structured(text: str) -> Dict[str, Any]:
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY is not configured")
+
+    client = OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
+    prompt = f"""
+Extract resume details and return JSON only with this exact schema:
+{{
+  "name": "",
+  "email": "",
+  "contact": "",
+  "skills": [],
+  "projects": [],
+  "internships": [],
+  "certifications": [],
+  "cgpa": "",
+  "degree": "",
+  "twelfth_marks": "",
+  "tenth_marks": "",
+  "achievements": [],
+  "full_text": ""
+}}
+
+Rules:
+- Keep skills as a flat list of strings including technical and soft skills.
+- Keep projects, internships, certifications, achievements as list of strings.
+- If a field is missing, keep empty string or empty list.
+- full_text must contain a compact summary of resume text (not empty).
+
+Resume:
+{text[:75000]}
+"""
+
+    response = client.chat.completions.create(
+        model="meta-llama/llama-4-scout-17b-16e-instruct",
+        temperature=0.1,
+        max_tokens=2200,
+        messages=[
+            {"role": "system", "content": "Return valid JSON only. No markdown."},
+            {"role": "user", "content": prompt},
+        ],
+    )
+
+    payload = _parse_json_from_llm(response.choices[0].message.content or "")
+    if not isinstance(payload, dict):
+        raise ValueError("GROQ response did not return an object")
+    payload.setdefault("name", "")
+    payload.setdefault("email", "")
+    payload.setdefault("contact", "")
+    payload.setdefault("skills", [])
+    payload.setdefault("projects", [])
+    payload.setdefault("internships", [])
+    payload.setdefault("certifications", [])
+    payload.setdefault("cgpa", "")
+    payload.setdefault("degree", "")
+    payload.setdefault("twelfth_marks", "")
+    payload.setdefault("tenth_marks", "")
+    payload.setdefault("achievements", [])
+    payload.setdefault("full_text", text[:3000])
+    return payload
+
+
+def _score_resume(item: Dict[str, Any]) -> Dict[str, Any]:
+    skills = item.get("skills") or []
+    projects = item.get("projects") or []
+    internships = item.get("internships") or []
+    certs = item.get("certifications") or []
+
+    skills_score = min(len(skills) * 3.5, 35)
+    experience_score = min(len(internships) * 8, 20)
+    projects_score = min(len(projects) * 4, 15)
+    certs_score = min(len(certs) * 3, 10)
+
+    cgpa = _safe_float(item.get("cgpa"))
+    twelfth = _safe_float(item.get("twelfth_marks"))
+    tenth = _safe_float(item.get("tenth_marks"))
+
+    cgpa_score = min((cgpa / 10.0) * 12, 12) if cgpa > 0 else 0
+    twelfth_score = min((twelfth / 100.0) * 5, 5) if twelfth > 0 else 0
+    tenth_score = min((tenth / 100.0) * 3, 3) if tenth > 0 else 0
+
+    total = round(skills_score + experience_score + projects_score + certs_score + cgpa_score + twelfth_score + tenth_score, 2)
+    summary = (
+        f"Selected for strong skills ({len(skills)}), "
+        f"experience entries ({len(internships)}), projects ({len(projects)}), "
+        f"and certifications ({len(certs)})."
+    )
+
+    return {
+        "score": total,
+        "summary": summary,
+    }
+
+
+def _try_openrouter_rerank(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not openrouter_client:
+        return candidates
+
+    compact = [
+        {
+            "name": c.get("name"),
+            "email": c.get("email"),
+            "skills": c.get("skills", [])[:12],
+            "projects": c.get("projects", [])[:6],
+            "internships": c.get("internships", [])[:6],
+            "certifications": c.get("certifications", [])[:8],
+            "cgpa": c.get("cgpa", ""),
+            "twelfth_marks": c.get("twelfth_marks", ""),
+            "tenth_marks": c.get("tenth_marks", ""),
+            "base_score": c.get("score", 0),
+        }
+        for c in candidates
+    ]
+
+    prompt = (
+        "Rerank these resumes for trainer shortlisting. "
+        "Consider skill relevance, experience, academics, certifications, project quality. "
+        "Return JSON list sorted descending with fields: name, score, summary. "
+        f"Input: {json.dumps(compact)}"
+    )
+
+    try:
+        response = openrouter_client.chat.completions.create(
+            model="gpt-4.1-mini",
+            temperature=0.2,
+            max_tokens=1200,
+            messages=[
+                {"role": "system", "content": "Return valid JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        parsed = _parse_json_from_llm(response.choices[0].message.content or "")
+        if not isinstance(parsed, list):
+            return candidates
+
+        by_name = {c.get("name", ""): c for c in candidates}
+        reranked: List[Dict[str, Any]] = []
+        for row in parsed:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name", "")).strip()
+            if name not in by_name:
+                continue
+            base = by_name[name]
+            base["score"] = round(float(row.get("score", base.get("score", 0))), 2)
+            if row.get("summary"):
+                base["summary"] = str(row.get("summary"))
+            reranked.append(base)
+
+        if not reranked:
+            return candidates
+
+        return sorted(reranked, key=lambda x: x.get("score", 0), reverse=True)
+    except Exception:
+        return candidates
+
+
+@router.post("/top_resume_filter/upload")
+async def upload_top_resume_filter_files(
+    files: List[UploadFile] = File(...),
+    authorization: str | None = Header(default=None),
+):
+    auth_payload = _require_trainer_role(authorization)
+
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not connected")
+    if not files:
+        raise HTTPException(status_code=400, detail="No files uploaded")
+
+    collection = db["top_resume_profiles"]
+    processed: List[Dict[str, Any]] = []
+
+    for file in files:
+        filename = file.filename or "unknown"
+        if not filename.lower().endswith((".pdf", ".doc", ".docx")):
+            processed.append({"filename": filename, "status": "failed", "error": "Unsupported file type"})
+            continue
+
+        try:
+            content = await file.read()
+            if not content:
+                processed.append({"filename": filename, "status": "failed", "error": "Empty file"})
+                continue
+
+            full_text = _extract_resume_text_from_bytes(filename, content)
+            if not full_text.strip():
+                processed.append({"filename": filename, "status": "failed", "error": "No readable text found"})
+                continue
+
+            extracted = _groq_extract_structured(full_text)
+            fingerprint = hashlib.sha256(content).hexdigest()
+
+            doc = {
+                "filename": filename,
+                "file_hash": fingerprint,
+                "uploaded_by": auth_payload.get("email", ""),
+                "name": extracted.get("name", ""),
+                "email": extracted.get("email", ""),
+                "contact": extracted.get("contact", ""),
+                "skills": extracted.get("skills", []),
+                "projects": extracted.get("projects", []),
+                "internships": extracted.get("internships", []),
+                "certifications": extracted.get("certifications", []),
+                "cgpa": extracted.get("cgpa", ""),
+                "degree": extracted.get("degree", ""),
+                "twelfth_marks": extracted.get("twelfth_marks", ""),
+                "tenth_marks": extracted.get("tenth_marks", ""),
+                "achievements": extracted.get("achievements", []),
+                "full_text": extracted.get("full_text", full_text[:3000]),
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+
+            collection.update_one(
+                {"file_hash": fingerprint},
+                {"$set": doc, "$setOnInsert": {"created_at": datetime.utcnow().isoformat()}},
+                upsert=True,
+            )
+
+            processed.append(
+                {
+                    "filename": filename,
+                    "status": "completed",
+                    "name": doc.get("name") or "",
+                    "email": doc.get("email") or "",
+                }
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            processed.append({"filename": filename, "status": "failed", "error": str(exc)})
+
+    return {
+        "status": "success",
+        "processed_count": len([p for p in processed if p.get("status") == "completed"]),
+        "results": processed,
+    }
+
+
+@router.post("/top_resume_filter/top_n")
+async def get_top_resumes(
+    request: TopResumeFilterRequest,
+    authorization: str | None = Header(default=None),
+):
+    auth_payload = _require_trainer_role(authorization)
+
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not connected")
+
+    top_n = max(1, min(int(request.top_n or 5), 50))
+    command_text = (request.command or "").strip().lower()
+    if command_text:
+        m = re.search(r"top\s+(\d+)", command_text)
+        if m:
+            top_n = max(1, min(int(m.group(1)), 50))
+
+    collection = db["top_resume_profiles"]
+    requested_filenames = []
+    if request.filenames:
+        requested_filenames = [str(name).strip() for name in request.filenames if str(name).strip()]
+
+    query: Dict[str, Any] = {}
+    if requested_filenames:
+        query["filename"] = {"$in": requested_filenames}
+    else:
+        trainer_email = str(auth_payload.get("email", "")).strip()
+        if trainer_email:
+            query["uploaded_by"] = trainer_email
+
+    records = list(collection.find(query, {"_id": 0}))
+    if not records:
+        return {"status": "success", "count": 0, "results": []}
+
+    ranked: List[Dict[str, Any]] = []
+    for rec in records:
+        score_info = _score_resume(rec)
+        ranked.append(
+            {
+                "name": rec.get("name") or rec.get("filename") or "Unknown",
+                "email": rec.get("email") or "",
+                "filename": rec.get("filename") or "",
+                "skills": rec.get("skills") or [],
+                "projects": rec.get("projects") or [],
+                "internships": rec.get("internships") or [],
+                "certifications": rec.get("certifications") or [],
+                "cgpa": rec.get("cgpa") or "",
+                "twelfth_marks": rec.get("twelfth_marks") or "",
+                "tenth_marks": rec.get("tenth_marks") or "",
+                "score": score_info["score"],
+                "summary": score_info["summary"],
+            }
+        )
+
+    ranked.sort(key=lambda x: x.get("score", 0), reverse=True)
+    if not openrouter_client:
+        raise HTTPException(
+            status_code=500,
+            detail="OpenRouter API is mandatory for this feature. Please configure OPENROUTER_API_KEY.",
+        )
+    ranked = _try_openrouter_rerank(ranked)
+
+    top = ranked[:top_n]
+    output = [
+        {
+            "rank": idx + 1,
+            "candidate_name": row.get("name", "Unknown"),
+            "key_skills": row.get("skills", [])[:8],
+            "score": row.get("score", 0),
+            "summary": row.get("summary", ""),
+            "email": row.get("email", ""),
+        }
+        for idx, row in enumerate(top)
+    ]
+
+    return {"status": "success", "count": len(output), "results": output}
