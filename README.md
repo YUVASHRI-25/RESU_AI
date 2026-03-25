@@ -40,6 +40,32 @@ FINAL-1/
 
 ## Getting Started
 
+## Run With Docker
+
+From the project root, run:
+
+```bash
+docker compose up --build
+```
+
+This starts:
+
+- Frontend: http://localhost:3000
+- Backend API: http://localhost:8000
+- MongoDB: localhost:27017
+
+To stop containers:
+
+```bash
+docker compose down
+```
+
+To stop and also remove persisted Mongo data volume:
+
+```bash
+docker compose down -v
+```
+
 ### Backend Setup
 
 1. Navigate to the backend directory:

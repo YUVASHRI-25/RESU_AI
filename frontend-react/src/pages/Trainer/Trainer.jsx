@@ -4,7 +4,7 @@ import { X, PlusCircle, Upload, Filter, FileText, TrendingUp, Users, Award, Tras
 
 const Trainer = () => {
   const navigate = useNavigate();
-  const [activeTab, setActiveTab] = useState("filter"); // "filter" or "skillset"
+  const [activeTab, setActiveTab] = useState("filter"); // "filter" | "top-resume" | "skillset"
   const [totalFiles, setTotalFiles] = useState(0);
   const [processedFiles, setProcessedFiles] = useState(0);
   const [loading, setLoading] = useState(false);
@@ -17,6 +17,12 @@ const Trainer = () => {
   const [uploadMode, setUploadMode] = useState("replace"); // "replace" or "append"
   const [editMode, setEditMode] = useState(false); // Edit existing skillset
   const [editedData, setEditedData] = useState(null); // Store edited data
+
+  // Top Resume Filter tab state
+  const [topResumeFiles, setTopResumeFiles] = useState([]);
+  const [topResumeLoading, setTopResumeLoading] = useState(false);
+  const [topResumeResults, setTopResumeResults] = useState([]);
+  const [topResumeCommand, setTopResumeCommand] = useState("Show Top 5 Resumes");
   
   // Get current active skillset data
   const currentSkillset = skillsetUploads.find(s => s.id === activeSkillsetTab);
@@ -372,6 +378,169 @@ const handleSort = (key) => {
     }
   };
 
+  const handleTopResumeFiles = (e) => {
+    const files = Array.from(e.target.files || []);
+    if (!files.length) return;
+
+    const mapped = files.map((file) => ({
+      file,
+      name: file.name,
+      status: "Uploaded",
+      error: "",
+    }));
+
+    setTopResumeFiles((prev) => {
+      const existing = new Set(prev.map((f) => `${f.name}-${f.file?.size || 0}`));
+      const fresh = mapped.filter((f) => !existing.has(`${f.name}-${f.file.size}`));
+      return [...prev, ...fresh];
+    });
+
+    e.target.value = "";
+  };
+
+  const removeTopResumeFile = (name) => {
+    setTopResumeFiles((prev) => prev.filter((f) => f.name !== name));
+  };
+
+  const processTopResumeUploads = async () => {
+    if (!topResumeFiles.length) {
+      alert("Please upload at least one resume file.");
+      return;
+    }
+
+    const token = localStorage.getItem("access_token");
+    if (!token) {
+      alert("Login session missing. Please log in again.");
+      return;
+    }
+
+    setTopResumeLoading(true);
+    setTopResumeResults([]);
+    setTopResumeFiles((prev) => prev.map((f) => ({ ...f, status: "Processing", error: "" })));
+
+    const formData = new FormData();
+    topResumeFiles.forEach((item) => formData.append("files", item.file));
+
+    try {
+      const res = await fetch("http://127.0.0.1:8000/admin/top_resume_filter/upload", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: formData,
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.detail || "Failed to process uploaded resumes.");
+        setTopResumeFiles((prev) => prev.map((f) => ({ ...f, status: "Uploaded" })));
+        return;
+      }
+
+      const byName = new Map((data.results || []).map((r) => [r.filename, r]));
+      setTopResumeFiles((prev) =>
+        prev.map((f) => {
+          const rec = byName.get(f.name);
+          if (!rec) return { ...f, status: "Uploaded" };
+          return {
+            ...f,
+            status: rec.status === "completed" ? "Completed" : "Uploaded",
+            error: rec.error || "",
+          };
+        })
+      );
+    } catch (err) {
+      alert("Error while processing resumes.");
+      setTopResumeFiles((prev) => prev.map((f) => ({ ...f, status: "Uploaded" })));
+    } finally {
+      setTopResumeLoading(false);
+    }
+  };
+
+  const fetchTopResumes = async () => {
+    const token = localStorage.getItem("access_token");
+    if (!token) {
+      alert("Login session missing. Please log in again.");
+      return;
+    }
+
+    setTopResumeLoading(true);
+    try {
+      const topNumMatch = topResumeCommand.match(/top\s+(\d+)/i);
+      const topN = topNumMatch ? Number(topNumMatch[1]) : 5;
+      const res = await fetch("http://127.0.0.1:8000/admin/top_resume_filter/top_n", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          top_n: topN,
+          command: topResumeCommand,
+          use_openrouter: true,
+          filenames: topResumeFiles.map((f) => f.name),
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.detail || "Failed to fetch top resumes.");
+        return;
+      }
+
+      setTopResumeResults(data.results || []);
+    } catch (err) {
+      alert("Error fetching top resumes.");
+    } finally {
+      setTopResumeLoading(false);
+    }
+  };
+
+  const downloadTopResumeReport = async () => {
+    if (!topResumeResults.length) {
+      alert("No Top Resume results to export.");
+      return;
+    }
+
+    const { jsPDF } = await import("jspdf");
+    const doc = new jsPDF();
+
+    doc.setFontSize(16);
+    doc.text("Top Resume Filter Report", 14, 18);
+    doc.setFontSize(10);
+    doc.text(`Generated: ${new Date().toLocaleString()}`, 14, 24);
+
+    let y = 34;
+    topResumeResults.forEach((row, index) => {
+      const skills = (row.key_skills || []).slice(0, 6).join(", ") || "-";
+      const summary = row.summary || "-";
+
+      doc.setFontSize(11);
+      doc.text(`${index + 1}. ${row.candidate_name || "Unknown"}  |  Score: ${row.score ?? 0}`, 14, y);
+      y += 6;
+
+      doc.setFontSize(9);
+      doc.text(`Skills: ${skills}`, 14, y);
+      y += 5;
+
+      const wrappedSummary = doc.splitTextToSize(`Summary: ${summary}`, 180);
+      doc.text(wrappedSummary, 14, y);
+      y += wrappedSummary.length * 4 + 4;
+
+      if (y > 270) {
+        doc.addPage();
+        y = 20;
+      }
+    });
+
+    doc.save("Top_Resume_Filter_Report.pdf");
+  };
+
+  const topResumeUploadedCount = topResumeFiles.length;
+  const topResumeCompletedCount = topResumeFiles.filter((f) => f.status === "Completed").length;
+  const topResumeProcessingCount = topResumeFiles.filter((f) => f.status === "Processing").length;
+  const topResumeProgressPercent = topResumeUploadedCount
+    ? Math.round((topResumeCompletedCount / topResumeUploadedCount) * 100)
+    : 0;
+
   const handleSkillsetUpload = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -631,6 +800,23 @@ const handleSort = (key) => {
       >
         <Award size={16} style={{ display: "inline", marginRight: "8px" }} />
         Company Skillset
+      </button>
+      <button
+        onClick={() => setActiveTab("top-resume")}
+        style={{
+          padding: "12px 20px",
+          background: activeTab === "top-resume" ? "rgba(255,255,255,0.2)" : "transparent",
+          color: "#fff",
+          border: "none",
+          borderBottom: activeTab === "top-resume" ? "3px solid #fff" : "none",
+          cursor: "pointer",
+          fontSize: "15px",
+          fontWeight: activeTab === "top-resume" ? "600" : "500",
+          transition: "all 0.3s",
+        }}
+      >
+        <TrendingUp size={16} style={{ display: "inline", marginRight: "8px" }} />
+        Top Resume Filter
       </button>
       
       {/* Logout Button */}
@@ -1713,6 +1899,272 @@ const handleSort = (key) => {
           )
         )}
         </>
+        )}
+
+        {/* Top Resume Filter Tab */}
+        {activeTab === "top-resume" && (
+          <div
+            style={{
+              background: "white",
+              borderRadius: "16px",
+              padding: "24px",
+              border: "1px solid #e2e8f0",
+              boxShadow: "0 1px 3px rgba(0, 0, 0, 0.05)",
+            }}
+          >
+            <h2 style={{ fontSize: "24px", fontWeight: "700", color: "#1e293b", marginBottom: "10px" }}>
+              Top Resume Filter
+            </h2>
+            <p style={{ color: "#64748b", marginBottom: "20px" }}></p>
+
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                gap: "12px",
+                marginBottom: "18px",
+              }}
+            >
+              <div
+                style={{
+                  padding: "14px",
+                  borderRadius: "10px",
+                  background: "#eef2ff",
+                  border: "1px solid #c7d2fe",
+                }}
+              >
+                <div style={{ fontSize: "12px", color: "#475569", marginBottom: "4px" }}>Uploaded Resumes</div>
+                <div style={{ fontSize: "24px", fontWeight: "700", color: "#1e3a8a" }}>{topResumeUploadedCount}</div>
+              </div>
+              <div
+                style={{
+                  padding: "14px",
+                  borderRadius: "10px",
+                  background: "#ecfdf5",
+                  border: "1px solid #a7f3d0",
+                }}
+              >
+                <div style={{ fontSize: "12px", color: "#475569", marginBottom: "4px" }}>Completed</div>
+                <div style={{ fontSize: "24px", fontWeight: "700", color: "#065f46" }}>{topResumeCompletedCount}</div>
+              </div>
+              <div
+                style={{
+                  padding: "14px",
+                  borderRadius: "10px",
+                  background: "#f8fafc",
+                  border: "1px solid #cbd5e1",
+                }}
+              >
+                <div style={{ fontSize: "12px", color: "#475569", marginBottom: "4px" }}>
+                  Processing Progress ({topResumeProcessingCount} active)
+                </div>
+                <div style={{ fontSize: "22px", fontWeight: "700", color: "#0f172a", marginBottom: "8px" }}>
+                  {topResumeProgressPercent}%
+                </div>
+                <div
+                  style={{
+                    height: "8px",
+                    borderRadius: "8px",
+                    background: "#e2e8f0",
+                    overflow: "hidden",
+                  }}
+                >
+                  <div
+                    style={{
+                      width: `${topResumeProgressPercent}%`,
+                      height: "100%",
+                      background: "linear-gradient(135deg, #22c55e 0%, #16a34a 100%)",
+                      transition: "width 0.4s ease",
+                    }}
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div
+              style={{
+                border: "2px dashed #cbd5e1",
+                borderRadius: "12px",
+                padding: "28px",
+                textAlign: "center",
+                background: "#f8fafc",
+                marginBottom: "16px",
+                position: "relative",
+              }}
+            >
+              <input
+                type="file"
+                multiple
+                accept=".pdf,.doc,.docx"
+                onChange={handleTopResumeFiles}
+                style={{
+                  position: "absolute",
+                  inset: 0,
+                  opacity: 0,
+                  cursor: "pointer",
+                }}
+              />
+              <Upload size={36} color="#667eea" style={{ marginBottom: "8px" }} />
+              <p style={{ margin: 0, color: "#1f2937", fontWeight: "600" }}>
+                Click to upload resumes
+              </p>
+              <p style={{ margin: "6px 0 0 0", color: "#94a3b8", fontSize: "13px" }}>
+                Supports PDF, DOC, DOCX
+              </p>
+            </div>
+
+            {topResumeFiles.length > 0 && (
+              <div style={{ marginBottom: "18px" }}>
+                <h3 style={{ fontSize: "15px", color: "#334155", marginBottom: "10px" }}>Uploaded Files</h3>
+                <div style={{ display: "grid", gap: "8px" }}>
+                  {topResumeFiles.map((item, idx) => (
+                    <div
+                      key={`${item.name}-${idx}`}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        border: "1px solid #e2e8f0",
+                        borderRadius: "8px",
+                        padding: "10px 12px",
+                        background: "#fff",
+                      }}
+                    >
+                      <div style={{ display: "flex", flexDirection: "column", gap: "2px" }}>
+                        <span style={{ color: "#1f2937", fontWeight: "600", fontSize: "13px" }}>{item.name}</span>
+                        <span style={{ color: "#64748b", fontSize: "12px" }}>
+                          Status: {item.status}
+                          {item.error ? ` | ${item.error}` : ""}
+                        </span>
+                      </div>
+
+                      <button
+                        onClick={() => removeTopResumeFile(item.name)}
+                        style={{
+                          border: "none",
+                          background: "transparent",
+                          color: "#ef4444",
+                          cursor: "pointer",
+                          fontWeight: "700",
+                        }}
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div style={{ display: "flex", flexWrap: "wrap", gap: "12px", marginBottom: "20px" }}>
+              <button
+                onClick={processTopResumeUploads}
+                disabled={topResumeLoading || topResumeFiles.length === 0}
+                style={{
+                  padding: "10px 16px",
+                  border: "none",
+                  borderRadius: "8px",
+                  color: "#fff",
+                  fontWeight: "700",
+                  cursor: topResumeLoading ? "not-allowed" : "pointer",
+                  background: topResumeLoading
+                    ? "#94a3b8"
+                    : "linear-gradient(135deg, #22c55e 0%, #16a34a 100%)",
+                }}
+              >
+                {topResumeLoading ? "Processing..." : "Process Uploaded Resumes"}
+              </button>
+
+            </div>
+
+            <div style={{ display: "flex", gap: "10px", marginBottom: "18px" }}>
+              <input
+                type="text"
+                value={topResumeCommand}
+                onChange={(e) => setTopResumeCommand(e.target.value)}
+                placeholder="Show Top 5 Resumes"
+                style={{
+                  flex: 1,
+                  border: "2px solid #e2e8f0",
+                  borderRadius: "8px",
+                  padding: "10px 12px",
+                  fontSize: "14px",
+                }}
+              />
+              <button
+                onClick={fetchTopResumes}
+                disabled={topResumeLoading}
+                style={{
+                  padding: "10px 16px",
+                  border: "none",
+                  borderRadius: "8px",
+                  color: "#fff",
+                  fontWeight: "700",
+                  cursor: topResumeLoading ? "not-allowed" : "pointer",
+                  background: "linear-gradient(135deg, #6366f1 0%, #4f46e5 100%)",
+                }}
+              >
+                Show Top Resumes
+              </button>
+              <button
+                onClick={downloadTopResumeReport}
+                disabled={!topResumeResults.length}
+                style={{
+                  padding: "10px 16px",
+                  border: "none",
+                  borderRadius: "8px",
+                  color: "#fff",
+                  fontWeight: "700",
+                  cursor: !topResumeResults.length ? "not-allowed" : "pointer",
+                  opacity: !topResumeResults.length ? 0.6 : 1,
+                  background: "linear-gradient(135deg, #0ea5e9 0%, #0284c7 100%)",
+                }}
+              >
+                Download Top N Report
+              </button>
+            </div>
+
+            {topResumeResults.length > 0 ? (
+              <div style={{ overflowX: "auto" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "13px" }}>
+                  <thead>
+                    <tr style={{ background: "#f8fafc" }}>
+                      <th style={{ border: "1px solid #e2e8f0", padding: "10px", textAlign: "left" }}>Rank</th>
+                      <th style={{ border: "1px solid #e2e8f0", padding: "10px", textAlign: "left" }}>Candidate Name</th>
+                      <th style={{ border: "1px solid #e2e8f0", padding: "10px", textAlign: "left" }}>Key Skills</th>
+                      <th style={{ border: "1px solid #e2e8f0", padding: "10px", textAlign: "left" }}>Score</th>
+                      <th style={{ border: "1px solid #e2e8f0", padding: "10px", textAlign: "left" }}>Summary</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {topResumeResults.map((row, idx) => (
+                      <tr key={`${row.candidate_name}-${idx}`}>
+                        <td style={{ border: "1px solid #e2e8f0", padding: "10px" }}>{row.rank}</td>
+                        <td style={{ border: "1px solid #e2e8f0", padding: "10px", fontWeight: "600" }}>{row.candidate_name}</td>
+                        <td style={{ border: "1px solid #e2e8f0", padding: "10px" }}>
+                          {(row.key_skills || []).slice(0, 6).join(", ") || "-"}
+                        </td>
+                        <td style={{ border: "1px solid #e2e8f0", padding: "10px" }}>{row.score}</td>
+                        <td style={{ border: "1px solid #e2e8f0", padding: "10px" }}>{row.summary || "-"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div
+                style={{
+                  border: "1px dashed #cbd5e1",
+                  borderRadius: "10px",
+                  padding: "24px",
+                  textAlign: "center",
+                  color: "#94a3b8",
+                }}
+              >
+                Top-ranked resumes will appear here after processing and filtering.
+              </div>
+            )}
+          </div>
         )}
 
         {/* Company Skillset Tab */}
