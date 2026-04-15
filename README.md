@@ -220,10 +220,6 @@ This project was conceptualized, designed, and developed by:
 
 **Srivarsha**
 
-**Arjun Hareesh**
-
-**Manoj**
-
 Together, the team combined expertise in AI, software development, and user experience to create a comprehensive career assistance platform that serves HR, trainers, and job seekers alike.
 
 
