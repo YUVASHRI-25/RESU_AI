@@ -19,12 +19,26 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60")
 
 # --- MongoDB ---
 MONGO_URI = os.getenv("MONGO_URI")
-MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "resume_analyzer")
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "RESUME")
 
 db = None
 if MONGO_URI:
     try:
-        client = MongoClient(MONGO_URI)
+        tls_params = {}
+        if MONGO_URI.startswith("mongodb+srv://") or "ssl=true" in MONGO_URI.lower():
+            import certifi
+            try:
+                import dns.resolver
+                dns.resolver.default_resolver = dns.resolver.Resolver(configure=False)
+                dns.resolver.default_resolver.nameservers = ["8.8.8.8", "1.1.1.1"]
+            except Exception:
+                pass
+            tls_params = {
+                "tls": True,
+                "tlsCAFile": certifi.where(),
+                "tlsAllowInvalidCertificates": True,
+            }
+        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000, **tls_params)
         db = client[MONGO_DB_NAME]
     except Exception as e:
         print("⚠️ MongoDB connection failed:", e)

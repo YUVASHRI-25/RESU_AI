@@ -26,9 +26,15 @@ logger = logging.getLogger(__name__)
 # -------------------------------
 try:
     uri = os.getenv("MONGO_URI")
-    db_name = os.getenv("MONGO_DB_NAME")
+    db_name = os.getenv("MONGO_DB_NAME", "RESUME")
     tls_params = {}
     if uri and (uri.startswith("mongodb+srv://") or "ssl=true" in uri.lower()):
+        try:
+            import dns.resolver
+            dns.resolver.default_resolver = dns.resolver.Resolver(configure=False)
+            dns.resolver.default_resolver.nameservers = ["8.8.8.8", "1.1.1.1"]
+        except Exception:
+            pass
         tls_params = {
             "tls": True,
             "tlsCAFile": certifi.where(),
